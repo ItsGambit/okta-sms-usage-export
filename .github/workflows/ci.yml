@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.13"]
+        include:
+          # Oldest supported interpreter (not offered on Apple-silicon macOS runners).
+          - os: ubuntu-latest
+            python: "3.8"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Compile
+        run: python -I -m py_compile okta_sms_usage.py
+
+      - name: Help and argument guards
+        shell: bash
+        run: |
+          python -I okta_sms_usage.py --help > /dev/null
+          # --non-interactive without --accept-risk must refuse (exit 2) and never reach the network
+          set +e
+          python -I okta_sms_usage.py --non-interactive --log-file ""; rc=$?
+          [ "$rc" = 2 ] || { echo "expected exit 2, got $rc"; exit 1; }
+          # a dry run must succeed with no token and no network
+          python -I okta_sms_usage.py --non-interactive --accept-risk --org-url https://example.okta.com \
+            --start 2026-01-01 --end 2026-01-31 --dry-run --log-file ""; rc=$?
+          [ "$rc" = 0 ] || { echo "dry run failed: $rc"; exit 1; }
+          [ ! -e okta_sms_usage.csv ] || { echo "dry run wrote a CSV"; exit 1; }
+
+      - name: End-to-end test against a mocked Okta API
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/mock_test.py" <<'PY'
+          import csv, email.utils, importlib.util, io, json, os, sys, time, urllib.error, urllib.request
+
+          spec = importlib.util.spec_from_file_location("m", os.path.join(os.environ["GITHUB_WORKSPACE"], "okta_sms_usage.py"))
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+          ORG = "https://example.okta.com"
+          def ev(i, t, res="SUCCESS"):
+              return {"uuid": f"u{i}", "published": "2026-10-05T10:00:00.000Z", "eventType": t,
+                      "outcome": {"result": res}, "actor": {"alternateId": "a@example.com"}, "client": {},
+                      "target": [{"type": "User", "alternateId": "t@example.com"}]}
+          PAGES = {1: [ev(1, "system.sms.send_factor_verify_message"), ev(2, "system.sms.send_phone_verification_message", "DENY")],
+                   2: [ev(3, "system.voice.send_mfa_challenge_call"), ev(2, "system.sms.send_phone_verification_message", "DENY")],
+                   3: []}
+
+          class H(dict):
+              def __init__(self, d, link=()): super().__init__(d); self.link = list(link)
+              def get_all(self, k): return self.link
+          class R:
+              def __init__(self, body, headers): self.b = json.dumps(body).encode(); self.headers = headers
+              def read(self, n=-1): return self.b
+              def __enter__(self): return self
+              def __exit__(self, *a): pass
+
+          now = int(time.time()); date = email.utils.formatdate(now, usegmt=True)
+          sleeps, calls = [], []
+          m.time.sleep = lambda s: sleeps.append(s)
+
+          def fake(req, timeout=0):
+              calls.append(req)
+              url = req.full_url
+              if len(calls) == 1:  # first call is rate limited
+                  raise urllib.error.HTTPError(url, 429, "x", H({"X-Rate-Limit-Reset": str(now + 7), "Date": date}), io.BytesIO(b"{}"))
+              p = 2 if "after=p2" in url else 3 if "after=p3" in url else 1
+              nxt = {1: f'<{ORG}/api/v1/logs?after=p2>; rel="next"', 2: f'<{ORG}/api/v1/logs?after=p3>; rel="next"'}.get(p)
+              remaining = "6" if p == 1 else "50"   # page 1 leaves only the 10% reserve of 60
+              return R(PAGES[p], H({"X-Rate-Limit-Limit": "60", "X-Rate-Limit-Remaining": remaining,
+                                    "X-Rate-Limit-Reset": str(now + 5), "Date": date}, [nxt] if nxt else []))
+          urllib.request.urlopen = fake
+
+          os.environ["OKTA_API_TOKEN"] = "SECRETTOKEN123"
+          argv = ["--non-interactive", "--accept-risk", "--org-url", "example.okta.com", "--include-voice",
+                  "--start", "2026-09-01", "--end", "2026-11-05", "--output", "out.csv", "--log-file", "run.log"]
+          assert m.main(argv) == 0
+
+          rows = list(csv.DictReader(open("out.csv", encoding="utf-8-sig")))
+          assert len(rows) == 3, rows                                   # duplicate event removed
+          assert [r["counted_as_sent"] for r in rows] == ["yes", "no", "yes"], rows
+          assert [r["channel"] for r in rows] == ["SMS", "SMS", "Voice"], rows
+          assert sleeps[0] == 8, sleeps                                 # 429: wait for reset (+1s guard)
+          assert 6 in sleeps[1:], sleeps                                # 90% rule: waits for the window to reset
+          assert all(c.get_header("Authorization") == "SSWS SECRETTOKEN123" for c in calls)
+          assert "SECRETTOKEN123" not in open("run.log", encoding="utf-8").read()   # token never logged
+          # the token must never be sent outside the configured org
+          try:
+              m.api_get("https://evil.example.com/x", "t", ORG); raise SystemExit("followed off-org link")
+          except m.OktaError:
+              pass
+          os.environ.pop("OKTA_API_TOKEN")
+          assert m.main(argv) == 2                                      # missing token -> config error
+          print("mock end-to-end test passed")
+          PY
+          mkdir -p "$RUNNER_TEMP/run" && cd "$RUNNER_TEMP/run"
+          python -I "$RUNNER_TEMP/mock_test.py"
+
+  launchers:
+    name: Launchers
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: ShellCheck (bash launcher)
+        if: runner.os == 'Linux'
+        run: |
+          shellcheck run_okta_sms_usage.sh
+          bash run_okta_sms_usage.sh --dry-run --non-interactive --accept-risk --org-url https://example.okta.com --log-file ""
+
+      - name: PowerShell launcher
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $e = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\run_okta_sms_usage.ps1", [ref]$null, [ref]$e)
+          if ($e) { $e; exit 1 }
+          & .\run_okta_sms_usage.ps1 --dry-run --non-interactive --accept-risk --org-url https://example.okta.com --log-file ""
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
